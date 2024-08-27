@@ -1,0 +1,164 @@
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
+import time
+import tracemalloc
+import csv
+import numpy as np
+from tqdm import tqdm
+
+class ComplexCNN(nn.Module):
+    def __init__(self):
+        super(ComplexCNN, self).__init__()
+        
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu1 = nn.ReLU()
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.relu2 = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.relu3 = nn.ReLU()
+        self.conv4 = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1)
+        self.bn4 = nn.BatchNorm2d(128)
+        self.relu4 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.conv5 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
+        self.bn5 = nn.BatchNorm2d(256)
+        self.relu5 = nn.ReLU()
+        self.conv6 = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1)
+        self.bn6 = nn.BatchNorm2d(256)
+        self.relu6 = nn.ReLU()
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.conv7 = nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1)
+        self.bn7 = nn.BatchNorm2d(512)
+        self.relu7 = nn.ReLU()
+        self.conv8 = nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1)
+        self.bn8 = nn.BatchNorm2d(512)
+        self.relu8 = nn.ReLU()
+        self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.fc1 = nn.Linear(512, 1024)
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(1024, 512)
+        self.fc3 = nn.Linear(512, 10)
+
+    def forward(self, x):
+        x = self.pool1(self.relu2(self.bn2(self.conv2(self.relu1(self.bn1(self.conv1(x)))))))
+        x = self.pool2(self.relu4(self.bn4(self.conv4(self.relu3(self.bn3(self.conv3(x)))))))
+        x = self.pool3(self.relu6(self.bn6(self.conv6(self.relu5(self.bn5(self.conv5(x)))))))
+        x = self.pool4(self.relu8(self.bn8(self.conv8(self.relu7(self.bn7(self.conv7(x)))))))
+        x = x.reshape(x.size(0), -1)
+        x = self.relu1(self.fc1(x))
+        x = self.dropout(x)
+        x = self.relu2(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+def evaluate_model(model, test_loader, device):
+    model.eval()
+    correct = 0
+    total = 0
+    inference_time = 0.0
+    
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader, desc="Evaluating Model"):
+            images, labels = images.to(device), labels.to(device)
+            batch_start_time = time.time()
+            outputs = model(images)
+            inference_time += time.time() - batch_start_time
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    accuracy = 100 * correct / total
+    inference_time_per_image = inference_time / total
+    
+    return accuracy, inference_time_per_image
+
+def measure_memory_footprint(model, input_size, device):
+    tracemalloc.start()
+    dummy_input = torch.randn(*input_size).to(device)
+    model(dummy_input)
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return current / 1024, peak / 1024  # KB 단위로 반환
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize((0.1307,), (0.3081,))
+])
+
+mnist_test = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+test_loader = DataLoader(mnist_test, batch_size=1024, shuffle=False)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+model_paths = {
+    "Original Model": "original_model.pt",
+    "PTQ Model": "ptq_model.pt",
+    "QAT Model": "qat_model.pt"
+}
+
+num_iterations = 5
+
+all_results = {model_name: [] for model_name in model_paths.keys()}
+
+for i in tqdm(range(num_iterations), desc="Overall Progress"):
+    for model_name, model_path in tqdm(model_paths.items(), desc=f"Iteration {i+1}/{num_iterations}", leave=False):
+        print(model_name)
+        model = torch.load(model_path, map_location=device).to(device)
+        
+        accuracy, inference_time_per_image = evaluate_model(model, test_loader, device)
+        input_size = (1, 1, 28, 28)
+        current_memory, peak_memory = measure_memory_footprint(model, input_size, device)
+        
+        all_results[model_name].append({
+            "Accuracy": accuracy,
+            "Inference Time per Image (ms)": inference_time_per_image * 1000,
+            "Current Memory Usage (KB)": current_memory,
+            "Peak Memory Usage (KB)": peak_memory
+        })
+
+summary_results = {model_name: {} for model_name in model_paths.keys()}
+for model_name, results in all_results.items():
+    metrics = results[0].keys()
+    for metric in metrics:
+        values = [result[metric] for result in results]
+        summary_results[model_name][f"{metric} Mean"] = np.mean(values)
+        summary_results[model_name][f"{metric} Max"] = np.max(values)
+        summary_results[model_name][f"{metric} Min"] = np.min(values)
+
+csv_filename = "model_evaluation_results.csv"
+with open(csv_filename, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    
+    headers = ["Model", "Iteration"] + list(results[0].keys())
+    writer.writerow(headers)
+    
+    for model_name, results in all_results.items():
+        for i, result in enumerate(results):
+            writer.writerow([model_name, i+1] + list(result.values()))
+    
+    writer.writerow([])
+    writer.writerow(["Model", "Metric", "Mean", "Max", "Min"])
+    for model_name, summary in summary_results.items():
+        for metric, value in summary.items():
+            metric_name = " ".join(metric.split()[:-1])
+            stat_type = metric.split()[-1]
+            if stat_type == "Mean":
+                mean_val = value
+            elif stat_type == "Max":
+                max_val = value
+            elif stat_type == "Min":
+                min_val = value
+            if stat_type == "Min":
+                writer.writerow([model_name, metric_name, mean_val, max_val, min_val])
+
+print(f"Results saved to {csv_filename}")
